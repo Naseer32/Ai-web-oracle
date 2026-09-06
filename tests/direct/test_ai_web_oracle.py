@@ -21,7 +21,7 @@ nothing here is a description of behavior, it's an assertion on it.
 import json
 
 
-CONTRACT_PATH = "ai_web_oracle.py"
+CONTRACT_PATH = "contracts/ai_web_oracle.py"
 
 
 def test_ids_start_at_one(direct_deploy):
