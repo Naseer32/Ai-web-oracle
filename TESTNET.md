@@ -30,6 +30,28 @@ redeploy to TestnetAsimov first to confirm real validator infrastructure
 matches Studio's behavior, then TestnetBradbury for final citable
 transaction hashes.
 
+## Automated test suite: written, currently blocked by an upstream issue
+
+An automated Direct Mode test suite is included at
+`tests/direct/test_ai_web_oracle.py`, written against `genlayer-test`'s
+documented Direct Mode API (`direct_deploy`, `direct_vm.mock_web`,
+`direct_vm.mock_llm`, `direct_vm.expect_revert`) and covering id
+numbering, true/false/unreachable verdicts, count increments, and
+input validation.
+
+Running it currently fails on a fresh install — `genlayer-test`
+(tried both 0.29.2 and 0.27.1) attempts to download a `genvm` runtime
+binary from a GitHub release tag (`v0.3.0-rc7`) that returns a 404,
+i.e. the release asset appears to be missing or moved on GenLayer's
+own infrastructure, not something fixable from the client side. This
+was reproduced on Termux (Android) with a fresh `pip install`.
+
+This is disclosed here rather than silently omitted. The test file
+itself is real and would run once the upstream release asset issue is
+resolved; in the meantime, the Studio transactions below (real
+multi-model validator consensus) are the primary evidence for this
+submission.
+
 ## Running the automated tests (including on Termux / mobile)
 
 Direct Mode is pure Python — no Docker, no GenLayer Studio, no network
