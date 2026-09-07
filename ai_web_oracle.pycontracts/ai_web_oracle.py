@@ -56,6 +56,19 @@ PATTERNS DEMONSTRATED (each is a reusable lesson, not just for this contract)
 6. Distinguishing expected (business-logic) errors from external
    (network/API) failures using `[EXPECTED]` / `[EXTERNAL]` error
    prefixes, so callers and block explorers can tell the two apart.
+7. Deterministic result-schema normalization: an LLM's JSON output can
+   express "verdict" as a real boolean, the string "true"/"false", or
+   even 1/0 depending on model quirks. `bool(x)` is NOT a safe way to
+   coerce this — `bool("false")` evaluates to `True`, because any
+   non-empty string is truthy in Python. That means a validator could
+   independently derive `verdict=False` while the same buggy coercion
+   on the leader's output stores `verdict=True`, silently breaking
+   validator/storage agreement. `normalize_result()` below is applied
+   identically in the validator comparison AND immediately before
+   storage, so the exact same deterministic parsing rules decide the
+   canonical value everywhere, and any output outside a small
+   recognized set falls back to a fixed default rather than to
+   Python truthiness.
 
 DESIGN NOTE — why not pin a content digest like a dispute-resolution
 contract would?
@@ -73,6 +86,106 @@ pattern by default.
 
 from genlayer import *
 from dataclasses import dataclass
+from typing import Any, Dict, Optional
+
+
+# ---------------------------------------------------------------------------
+# Deterministic result-schema normalization
+#
+# normalize_result(result: dict) -> {"verdict": bool, "confidence": str}
+#
+# Policy (deterministic — every validator running this code reaches the
+# same output for the same input, which is required for consensus):
+#   - verdict:
+#       * real bool                       -> kept as-is
+#       * int/float exactly 1 or 0        -> True / False
+#       * string "true"/"t"/"yes"/"y"/"1" -> True   (case-insensitive)
+#       * string "false"/"f"/"no"/"n"/"0" -> False  (case-insensitive)
+#       * anything else / missing         -> False  (conservative fallback,
+#                                             never Python-truthy coercion)
+#   - confidence:
+#       * "high"/"medium"/"low" (any case) -> kept, lowercased
+#       * numeric 0.0-1.0                  -> >=0.75 high, >=0.40 medium,
+#                                             else low
+#       * anything else / missing          -> "low" (conservative fallback)
+#
+# This same function is used in BOTH the leader/validator consensus path
+# (validator_fn) and immediately before constructing the on-chain
+# Verification record, so the two can never disagree.
+# ---------------------------------------------------------------------------
+
+
+def _parse_bool_candidate(val: Any) -> Optional[bool]:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, int):
+        if val == 1:
+            return True
+        if val == 0:
+            return False
+        return None
+    if isinstance(val, float):
+        # only accept exact 1.0 / 0.0 as booleans
+        if val == 1.0:
+            return True
+        if val == 0.0:
+            return False
+        return None
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in {"true", "t", "yes", "y", "1"}:
+            return True
+        if s in {"false", "f", "no", "n", "0"}:
+            return False
+        return None
+    return None
+
+
+def _parse_confidence_candidate(val: Any) -> Optional[str]:
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in {"high", "medium", "low"}:
+            return s
+        try:
+            f = float(s)
+        except Exception:
+            return None
+    elif isinstance(val, (int, float)):
+        f = float(val)
+    else:
+        return None
+
+    if f >= 0.75:
+        return "high"
+    if f >= 0.40:
+        return "medium"
+    return "low"
+
+
+def normalize_result(result: Dict[str, Any]) -> Dict[str, object]:
+    """
+    Normalize a model/agent result to a strict schema:
+        {"verdict": bool, "confidence": "high"|"medium"|"low"}
+
+    Deterministic fallback: unparseable/absent verdict -> False;
+    unparseable/absent confidence -> "low". Call this in every code
+    path that reads or stores a raw LLM result, so validators and
+    on-chain storage are always looking at the same canonical values.
+    """
+    if not isinstance(result, dict):
+        return {"verdict": False, "confidence": "low"}
+
+    raw_verdict = result.get("verdict", None)
+    parsed_verdict = _parse_bool_candidate(raw_verdict)
+    if parsed_verdict is None:
+        parsed_verdict = False  # deterministic fallback: conservative
+
+    raw_conf = result.get("confidence", None)
+    parsed_conf = _parse_confidence_candidate(raw_conf)
+    if parsed_conf is None:
+        parsed_conf = "low"  # deterministic fallback: conservative
+
+    return {"verdict": bool(parsed_verdict), "confidence": parsed_conf}
 
 
 @allow_storage
@@ -150,19 +263,33 @@ Respond with ONLY a JSON object matching this exact schema, no other text:
         def validator_fn(leaders_res) -> bool:
             if not isinstance(leaders_res, gl.vm.Return):
                 return False
-            my_result = leader_fn()
-            leader_result = leaders_res.calldata
-            # Consensus required on the DECISION only — reasoning text,
-            # and even the raw page content each validator fetched, are
-            # allowed to differ. That's what makes this practical: an
-            # exact-match requirement on LLM free text would fail
-            # consensus almost every time.
+
+            # Enforce the strict schema on BOTH sides of the comparison.
+            # Without this, a leader's JSON string "false" and a
+            # validator's real boolean False would compare unequal
+            # under naive equality, or worse, both could be coerced by
+            # bool(x) into True (bool("false") is True), letting
+            # validators silently agree on the wrong value.
+            my_result = normalize_result(leader_fn())
+            leader_result = normalize_result(leaders_res.calldata)
+
             return (
                 my_result["verdict"] == leader_result["verdict"]
                 and my_result["confidence"] == leader_result["confidence"]
             )
 
-        result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        raw_result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+
+        # Re-normalize the consensus result immediately before storage.
+        # This is the fix for the original bug: the old code did
+        # `verdict=bool(result["verdict"])`, and since any non-empty
+        # string (including the string "false") is truthy in Python,
+        # a raw LLM output of {"verdict": "false", ...} was stored as
+        # verdict=True — the exact opposite of what validators had just
+        # agreed on. Using the same normalize_result() call here as in
+        # validator_fn guarantees storage can never diverge from
+        # consensus.
+        normalized = normalize_result(raw_result)
 
         # ids start at 1, not 0, so the first verification is #1 —
         # more natural for on-chain records people will reference.
@@ -172,9 +299,9 @@ Respond with ONLY a JSON object matching this exact schema, no other text:
             requester=gl.message.sender_address,
             claim=claim,
             url=url,
-            verdict=bool(result["verdict"]),
-            confidence=str(result["confidence"]),
-            reasoning=str(result.get("reasoning", "")),
+            verdict=normalized["verdict"],
+            confidence=normalized["confidence"],
+            reasoning=str(raw_result.get("reasoning", "")) if isinstance(raw_result, dict) else "",
         )
         self.verifications.append(record)
         return record.id
